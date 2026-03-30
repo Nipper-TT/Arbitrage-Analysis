@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+*.csv
+*.png
+.kiro/
+.vscode/
+soybean_meal_analysis.py
