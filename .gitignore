@@ -6,3 +6,4 @@ __pycache__/
 .kiro/
 .vscode/
 soybean_meal_analysis.py
+backend/.cache/

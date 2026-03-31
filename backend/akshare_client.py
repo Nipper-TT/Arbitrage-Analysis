@@ -1,5 +1,6 @@
 """AKShare 数据获取封装"""
 
+import os
 from datetime import datetime, timedelta
 
 import akshare as ak
@@ -8,6 +9,39 @@ import pandas as pd
 import time
 
 from backend.models import DataFetchError
+
+# ── 缓存目录 ────────────────────────────────────────────────
+
+_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
+os.makedirs(_CACHE_DIR, exist_ok=True)
+
+_CACHE_MAX_AGE_HOURS = 4  # 缓存有效期（小时）
+
+
+def _cache_path(code: str, contract_type: str, years: int) -> str:
+    safe_code = code.replace(".", "_")
+    safe_type = contract_type.replace(" ", "_")
+    return os.path.join(_CACHE_DIR, f"{safe_type}_{safe_code}_{years}y.parquet")
+
+
+def _read_cache(code: str, contract_type: str, years: int) -> pd.DataFrame | None:
+    path = _cache_path(code, contract_type, years)
+    if not os.path.exists(path):
+        return None
+    age_hours = (time.time() - os.path.getmtime(path)) / 3600
+    if age_hours > _CACHE_MAX_AGE_HOURS:
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        return None
+
+
+def _write_cache(df: pd.DataFrame, code: str, contract_type: str, years: int) -> None:
+    try:
+        df.to_parquet(_cache_path(code, contract_type, years), index=False)
+    except Exception:
+        pass
 
 # ── 列名映射 ────────────────────────────────────────────────
 
@@ -260,13 +294,18 @@ async def fetch_contract_data(
 ) -> pd.DataFrame:
     """
     根据合约类型获取日线数据，返回统一列名的 DataFrame。
+    优先读取本地缓存（4小时有效），缓存未命中时调用接口并写入缓存。
 
     列: [date, open, close, high, low, volume, amount, open_interest]
     按日期升序排列，仅保留近 *years* 年数据。
-
-    Raises:
-        DataFetchError: 接口调用失败或返回空数据时抛出。
     """
+    # ── 尝试读缓存 ──────────────────────────────────────────
+    cached = _read_cache(code, contract_type, years)
+    if cached is not None and not cached.empty:
+        cached["date"] = pd.to_datetime(cached["date"])
+        return cached
+
+    # ── 调用接口 ────────────────────────────────────────────
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=years * 365)).strftime("%Y%m%d")
 
@@ -292,4 +331,8 @@ async def fetch_contract_data(
 
     # 按日期升序排列
     df = df.sort_values("date").reset_index(drop=True)
+
+    # ── 写入缓存 ────────────────────────────────────────────
+    _write_cache(df, code, contract_type, years)
+
     return df
