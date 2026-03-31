@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 import akshare as ak
 import pandas as pd
 
+import time
+
 from backend.models import DataFetchError
 
 # ── 列名映射 ────────────────────────────────────────────────
@@ -29,6 +31,17 @@ _FUTURES_COLUMN_MAP = {
     "持仓量": "open_interest",
 }
 
+# ── 新浪备用接口列名映射（stock_zh_a_daily 返回英文列名，但需要统一格式）──
+_SINA_COLUMN_MAP = {
+    "date": "date",
+    "open": "open",
+    "close": "close",
+    "high": "high",
+    "low": "low",
+    "volume": "volume",
+    "amount": "amount",
+}
+
 # ── 统一列集合 ──────────────────────────────────────────────
 
 _UNIFIED_COLUMNS = [
@@ -45,6 +58,35 @@ def _ensure_unified_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df[_UNIFIED_COLUMNS]
 
 
+def _fetch_sina_daily(code: str, start_date: str, end_date: str) -> pd.DataFrame | None:
+    """
+    新浪财经备用接口 (stock_zh_a_daily)。
+    symbol 格式: sh600519 / sz000001 / sh510300
+    返回统一列名 DataFrame，失败返回 None。
+    """
+    # 根据代码推断交易所前缀
+    if code.startswith(("6", "5")):
+        symbol = f"sh{code}"
+    elif code.startswith(("0", "1", "3")):
+        symbol = f"sz{code}"
+    else:
+        return None
+    try:
+        df = ak.stock_zh_a_daily(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            adjust="qfq",
+        )
+        if df is not None and not df.empty:
+            # 新浪接口列名已是英文，直接选取需要的列
+            df = df.rename(columns=_SINA_COLUMN_MAP)
+            return df
+    except Exception:
+        pass
+    return None
+
+
 def _filter_recent_years(df: pd.DataFrame, years: int) -> pd.DataFrame:
     """过滤近 N 年数据。"""
     cutoff = datetime.now() - timedelta(days=years * 365)
@@ -57,36 +99,42 @@ def _filter_recent_years(df: pd.DataFrame, years: int) -> pd.DataFrame:
 def _fetch_etf(code: str, start_date: str, end_date: str) -> pd.DataFrame:
     """
     获取 ETF 日线数据。
-    优先使用 stock_zh_a_hist，失败时回退到 fund_etf_hist_em。
+    优先 stock_zh_a_hist → 回退 fund_etf_hist_em → 最终备用 stock_zh_a_daily(新浪)。
     """
-    try:
-        df = ak.stock_zh_a_hist(
-            symbol=code,
-            period="daily",
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq",
-        )
-        if df is not None and not df.empty:
-            return df.rename(columns=_ETF_COLUMN_MAP)
-    except Exception:
-        pass
+    # 尝试1: 东方财富 stock_zh_a_hist
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                time.sleep(3)
+            df = ak.stock_zh_a_hist(
+                symbol=code, period="daily",
+                start_date=start_date, end_date=end_date, adjust="qfq",
+            )
+            if df is not None and not df.empty:
+                return df.rename(columns=_ETF_COLUMN_MAP)
+        except Exception:
+            pass
 
-    # 回退到 fund_etf_hist_em
-    try:
-        df = ak.fund_etf_hist_em(
-            symbol=code,
-            period="daily",
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq",
-        )
-        if df is not None and not df.empty:
-            return df.rename(columns=_ETF_COLUMN_MAP)
-    except Exception as exc:
-        raise DataFetchError(code, f"ETF 接口调用失败: {exc}") from exc
+    # 尝试2: 东方财富 fund_etf_hist_em
+    for attempt in range(2):
+        try:
+            if attempt > 0:
+                time.sleep(3)
+            df = ak.fund_etf_hist_em(
+                symbol=code, period="daily",
+                start_date=start_date, end_date=end_date, adjust="qfq",
+            )
+            if df is not None and not df.empty:
+                return df.rename(columns=_ETF_COLUMN_MAP)
+        except Exception:
+            pass
 
-    raise DataFetchError(code, "ETF 接口返回空数据")
+    # 尝试3: 新浪备用
+    df = _fetch_sina_daily(code, start_date, end_date)
+    if df is not None and not df.empty:
+        return df
+
+    raise DataFetchError(code, "ETF 所有接口均失败（东方财富+新浪）")
 
 
 # ── 期货数据获取 ────────────────────────────────────────────
@@ -110,57 +158,66 @@ def _fetch_futures(code: str, start_date: str, end_date: str) -> pd.DataFrame:
 # ── A股股票数据获取 ─────────────────────────────────────────
 
 def _fetch_a_stock(code: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """获取A股股票日线数据。"""
-    try:
-        df = ak.stock_zh_a_hist(
-            symbol=code,
-            period="daily",
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq",
-        )
-        if df is not None and not df.empty:
-            return df.rename(columns=_ETF_COLUMN_MAP)
-    except Exception as exc:
-        raise DataFetchError(code, f"A股接口调用失败: {exc}") from exc
-    raise DataFetchError(code, "A股接口返回空数据")
+    """获取A股股票日线数据。东方财富 → 新浪备用。"""
+    # 尝试1: 东方财富
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                time.sleep(3)
+            df = ak.stock_zh_a_hist(
+                symbol=code, period="daily",
+                start_date=start_date, end_date=end_date, adjust="qfq",
+            )
+            if df is not None and not df.empty:
+                return df.rename(columns=_ETF_COLUMN_MAP)
+        except Exception:
+            pass
+
+    # 尝试2: 新浪备用
+    df = _fetch_sina_daily(code, start_date, end_date)
+    if df is not None and not df.empty:
+        return df
+
+    raise DataFetchError(code, "A股所有接口均失败（东方财富+新浪）")
 
 
 # ── 美股数据获取 ────────────────────────────────────────────
 
 def _fetch_us_stock(code: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """获取美股日线数据。"""
-    try:
-        df = ak.stock_us_hist(
-            symbol=code,
-            period="daily",
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq",
-        )
-        if df is not None and not df.empty:
-            return df.rename(columns=_ETF_COLUMN_MAP)
-    except Exception as exc:
-        raise DataFetchError(code, f"美股接口调用失败: {exc}") from exc
+    """获取美股日线数据，带重试。"""
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                time.sleep(3)
+            df = ak.stock_us_hist(
+                symbol=code, period="daily",
+                start_date=start_date, end_date=end_date, adjust="qfq",
+            )
+            if df is not None and not df.empty:
+                return df.rename(columns=_ETF_COLUMN_MAP)
+        except Exception as exc:
+            if attempt == 2:
+                raise DataFetchError(code, f"美股接口调用失败: {exc}") from exc
     raise DataFetchError(code, "美股接口返回空数据")
 
 
 # ── 港股数据获取 ────────────────────────────────────────────
 
 def _fetch_hk_stock(code: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """获取港股日线数据。"""
-    try:
-        df = ak.stock_hk_hist(
-            symbol=code,
-            period="daily",
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq",
-        )
-        if df is not None and not df.empty:
-            return df.rename(columns=_ETF_COLUMN_MAP)
-    except Exception as exc:
-        raise DataFetchError(code, f"港股接口调用失败: {exc}") from exc
+    """获取港股日线数据，带重试。"""
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                time.sleep(3)
+            df = ak.stock_hk_hist(
+                symbol=code, period="daily",
+                start_date=start_date, end_date=end_date, adjust="qfq",
+            )
+            if df is not None and not df.empty:
+                return df.rename(columns=_ETF_COLUMN_MAP)
+        except Exception as exc:
+            if attempt == 2:
+                raise DataFetchError(code, f"港股接口调用失败: {exc}") from exc
     raise DataFetchError(code, "港股接口返回空数据")
 
 
